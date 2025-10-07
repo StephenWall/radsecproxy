@@ -211,6 +211,15 @@ int tlsconnect(struct server *server, int timeout, int reconnect) {
             }
 
             if (verifyconfcert(cert, server->conf, hp->host, server->dynamiclookuparg)) {
+                int rv = verifyocspcert(cert, server->ssl, server->conf->tlsconf);
+                if (rv < 0) {
+                    X509_free(cert);
+                    continue;
+                }
+                if (rv == 0) {
+                    debug(DBG_WARN, "tlsconnect: No OCSP information for cert, accepting anyways: %s",
+                          X509_NAME_oneline(X509_get_subject_name(cert), NULL, 0));
+                }
                 subj = getcertsubject(cert);
                 if (subj) {
                     debug(DBG_WARN, "tlsconnect: TLS connection to %s (%s port %s), subject %s, %s with cipher %s up",
@@ -411,16 +420,23 @@ void *tlsservernew(void *arg) {
                 verifyconfcert(cert, conf,
                                hp->prefixlen == 255 ? hp->host : addr2string((struct sockaddr *)&from, tmp, sizeof(tmp)),
                                NULL)) {
-                subj = getcertsubject(cert);
-                if (subj) {
-                    debug(DBG_WARN, "tlsservernew: TLS connection from %s, client %s, subject %s, %s with cipher %s up",
-                          addr2string((struct sockaddr *)&from, tmp, sizeof(tmp)), conf->name, subj,
-                          SSL_get_version(ssl), SSL_CIPHER_get_name(SSL_get_current_cipher(ssl)));
-                    free(subj);
+                int rv = verifyocspcert(cert, ssl, accepted_tls);
+                if (rv >= 0) {
+                    if (rv == 0) {
+                        /* It should be a configuration choice to proceed or abort. */
+                        debug(DBG_WARN, "tlsservernew: No OCSP information for cert, accepting anyways");
+                    }
+                    subj = getcertsubject(cert);
+                    if (subj) {
+                        debug(DBG_WARN, "tlsservernew: TLS connection from %s, client %s, subject %s, %s with cipher %s up",
+                              addr2string((struct sockaddr *)&from, tmp, sizeof(tmp)), conf->name, subj,
+                              SSL_get_version(ssl), SSL_CIPHER_get_name(SSL_get_current_cipher(ssl)));
+                        free(subj);
+                    }
+                    X509_free(cert);
+                    cert = NULL;
+                    break;
                 }
-                X509_free(cert);
-                cert = NULL;
-                break;
             }
             conf = find_clconf(handle, (struct sockaddr *)&from, &cur, &hp);
         }

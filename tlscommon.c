@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 #include <openssl/err.h>
 #include <openssl/md5.h>
+#include <openssl/ocsp.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
@@ -1081,6 +1082,363 @@ int certnairealmcheck(X509 *cert, const char *nairealm) {
     return result;
 }
 
+int verifyocspcert(X509 *peer_cert, SSL *ssl, struct tls *conf) {
+    int ret = 1; /* be optimistic */
+    STACK_OF(X509) *chain = NULL;
+    int num = 0;
+    X509 *issuer = NULL;
+    char *url = NULL;
+    STACK_OF(OPENSSL_STRING) *aia = NULL;
+    char *host = NULL;
+    char *port = NULL;
+    char *path = NULL;
+    int use_ssl = 0;
+    OCSP_REQUEST *req = NULL;
+    OCSP_CERTID *id = NULL;
+    BIO *bio = NULL;
+    SSL_CTX *ctx = NULL;
+    int rv;
+    int fd;
+    fd_set confds;
+    struct timeval tv;
+    OCSP_REQ_CTX *req_ctx = NULL;
+    OCSP_RESPONSE *resp = NULL;
+    fd_set *readfds;
+    fd_set *writefds;
+    OCSP_BASICRESP *basic = NULL;
+    int reason;
+    ASN1_GENERALIZEDTIME *revoked_at;
+    ASN1_GENERALIZEDTIME *this_update;
+    ASN1_GENERALIZEDTIME *next_update;
+    int ocsp_status;
+
+    if (!conf->ocspcheck) {
+        /* Not doing OCSP checks */
+        debug(DBG_DBG, "verifyocspcert: OCSP is off");
+        goto done;
+    }
+    if (!X509_NAME_cmp(X509_get_subject_name(peer_cert),
+                       X509_get_issuer_name(peer_cert))) {
+        /* Self-signed, don't do OCSP. */
+        debug(DBG_DBG, "verifyocspcert: cert is self-signed, no OCSP done");
+        goto done;
+    }
+
+    chain = SSL_get_peer_cert_chain(ssl);
+    num = sk_X509_num(chain);
+    if (num <= 0) {
+        /* Error or empty chain */
+        debug(DBG_ERR, "verifyocspcert: empty peer chain");
+        ret = 0;
+        goto done;
+    }
+    num--; /* convert count to index */
+
+    issuer = sk_X509_value(chain, num);
+    if (issuer == NULL) {
+        /* Error */
+        debug(DBG_ERR, "verifyocspcert: NULL in peer chain");
+        ret = 0;
+        goto done;
+    }
+    if (!X509_NAME_cmp(X509_get_subject_name(peer_cert),
+                       X509_get_subject_name(issuer))) {
+        /* first cert in chain is also the client cert, skip to next */
+        if (num <= 0) {
+            /* Error or empty chain */
+            debug(DBG_ERR, "verifyocspcert: empty peer chain");
+            ret = 0;
+            goto done;
+        }
+        num--;
+        issuer = sk_X509_value(chain, num);
+        if (issuer == NULL) {
+            /* Error */
+            debug(DBG_ERR, "verifyocspcert: NULL in peer chain");
+            ret = 0;
+            goto done;
+        }
+    }
+
+    if (conf->override_aia) {
+        url = conf->responder_url;
+        if (url == NULL || *url == '\0') {
+            aia = X509_get1_ocsp(peer_cert);
+            url = sk_OPENSSL_STRING_value(aia, 0);
+        }
+    } else {
+        aia = X509_get1_ocsp(peer_cert);
+        if (aia != NULL) {
+            url = sk_OPENSSL_STRING_value(aia, 0);
+        } else {
+            url = NULL;
+        }
+        if (url == NULL || *url == '\0') {
+            url = conf->responder_url;
+        }
+    }
+
+    if (OCSP_parse_url(url, &host, &port, &path, &use_ssl) == 0) {
+        /* Error */
+        debug(DBG_ERR, "verifyocspcert: Failure parsing URL: %s", url);
+        ret = 0;
+        goto done;
+    }
+
+    /* Now have peer cert, and it's issuer.  Do an OCSP validation, then advance
+     * to next cert in chain, and repeat.
+     * This could be made more efficient by sending all the Requests first, then
+     * waiting on the sockets for Responses, processing them as they come in,
+     * until all are received, or until timeout. */
+    while (issuer != NULL) {
+        if ((req = OCSP_REQUEST_new()) == NULL) {
+            /* Error */
+            debug(DBG_ERR, "verifyocspcert: could not create OCSP request");
+            ret = 0;
+            goto done;
+        }
+        if ((id = OCSP_cert_to_id(NULL, peer_cert, issuer)) == NULL) {
+            /* Error */
+            debug(DBG_ERR, "verifyocspcert: could not create OCSP id");
+            ret = 0;
+            goto done;
+        }
+        if ((OCSP_request_add0_id(req, id)) == NULL) {
+            /* Error */
+            debug(DBG_ERR, "verifyocspcert: could not add id to request");
+            ret = 0;
+            goto done;
+        }
+        if (conf->add_nonce &&
+            !OCSP_request_add1_nonce(req, NULL, -1)) {
+            /* Error */
+            debug(DBG_ERR, "verifyocspcert: could not add nonce to request");
+            ret = 0;
+            goto done;
+        }
+#if 0
+        if( conf->add_signature &&
+            ! OCSP_request_sign( req, certificate, key, digest, extra_certs, 0 ) ) {
+            /* Error */
+            debug( DBG_ERR, "verifyocspcert: could not add signature to request" );
+            ret = 0;
+            goto done;
+        }
+#endif
+
+        if ((bio = BIO_new_connect(host)) == NULL) {
+            /* Error */
+            debug(DBG_ERR, "verifyocspcert: could not connect to host %s", host);
+            ret = 0;
+            goto done;
+        }
+        BIO_set_nbio(bio, 1);
+        BIO_set_conn_port(bio, port);
+        if (use_ssl) {
+            BIO *sbio;
+            ctx = SSL_CTX_new(SSLv23_client_method());
+            if (ctx == NULL) {
+                debug(DBG_ERR, "verifyocspcert: could not create SSL context");
+                ret = 0;
+                goto done;
+            }
+            SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY);
+            sbio = BIO_new_ssl(ctx, 1);
+            bio = BIO_push(sbio, bio);
+        }
+
+        rv = BIO_do_connect(bio);
+        if (rv <= 0 && !BIO_should_retry(bio)) {
+            debug(DBG_ERR, "verifyocspcert: could not connect to host %s", host);
+            ret = 0;
+            goto done;
+        }
+
+        if (BIO_get_fd(bio, &fd) == -1) {
+            debug(DBG_ERR, "verifyocspcert: can't get connection descriptor");
+            ret = 0;
+            goto done;
+        }
+
+        if (rv <= 0) {
+            FD_ZERO(&confds);
+            FD_SET((unsigned int)fd, &confds);
+            tv.tv_usec = 0;
+            tv.tv_sec = 2;
+            rv = select(fd + 1, NULL, &confds, NULL, &tv);
+            if (rv <= 0) {
+                /* Error or timeout */
+                debug(DBG_ERR, "verifyocspcert: connect failure");
+                ret = 0;
+                goto done;
+            }
+        }
+
+        if ((req_ctx = OCSP_sendreq_new(bio, path, NULL, -1)) == NULL) {
+            /* Error */
+            debug(DBG_ERR, "verifyocspcert: failure creating request context");
+            ret = 0;
+            goto done;
+        }
+        /* add the HTTP headers */
+        if (!OCSP_REQ_CTX_add1_header(req_ctx, "Host", host)) {
+            debug(DBG_ERR, "verifyocspcert: could not add Host header to request");
+            ret = 0;
+            goto done;
+        }
+        /* add the remaining HTTP headers and the OCSP request body */
+        if (!OCSP_REQ_CTX_set1_req(req_ctx, req)) {
+            debug(DBG_ERR, "verifyocspcert: could not add request ID to the request");
+            ret = 0;
+            goto done;
+        }
+
+        while ((rv = OCSP_sendreq_nbio(&resp, req_ctx)) == -1) {
+            FD_ZERO(&confds);
+            FD_SET((unsigned int)fd, &confds);
+            tv.tv_usec = 0;
+            tv.tv_sec = 1;
+
+            readfds = BIO_should_read(bio) ? &confds : NULL;
+            writefds = BIO_should_write(bio) ? &confds : NULL;
+            if (readfds == NULL && writefds == NULL) {
+                /* Error */
+                debug(DBG_ERR, "verifyocspcert: unexpected retry condition");
+                ret = 0;
+                goto done;
+            }
+            rv = select(fd + 1, readfds, writefds, NULL, &tv);
+
+            if (rv == 0) {
+                /* Timeout */
+                debug(DBG_ERR, "verifyocspcert: timeout waiting on descriptor");
+                ret = 0;
+                goto done;
+            }
+            if (rv < 0) {
+                /* Error */
+                debug(DBG_ERR, "verifyocspcert: error waiting on descriptor");
+                ret = 0;
+                goto done;
+            }
+        }
+
+        if (rv != 1) {
+            debug(DBG_ERR, "verifyocspcert: error in OCSP_sendreq_nbio");
+            ret = 0;
+            goto done;
+        }
+
+        rv = OCSP_response_status(resp);
+        if (rv != OCSP_RESPONSE_STATUS_SUCCESSFUL) {
+            debug(DBG_ERR, "verifyocspcert: error in OCSP response");
+            ret = 0;
+            goto done;
+        }
+
+        basic = OCSP_response_get1_basic(resp);
+        if (basic == NULL) {
+            debug(DBG_ERR, "verifyocspcert: error parsing basic response");
+            ret = 0;
+            goto done;
+        }
+
+        if (conf->add_nonce) {
+            rv = OCSP_check_nonce(req, basic);
+            if (rv == -1) {
+                debug(DBG_ERR, "verifyocspcert: missing nonce");
+                ret = 0;
+                goto done;
+            }
+            if (rv <= 0) {
+                debug(DBG_ERR, "verifyocspcert: bad nonce");
+                ret = 0;
+                goto done;
+            }
+        }
+        rv = OCSP_basic_verify(basic, chain, SSL_CTX_get_cert_store(SSL_get_SSL_CTX(ssl)), 0);
+        if (rv <= 0) {
+            debug(DBG_ERR, "verifyocspcert: could not verify basic response");
+            ret = 0;
+            goto done;
+        }
+
+        if (!OCSP_resp_find_status(basic, id, &ocsp_status, &reason, &revoked_at, &this_update, &next_update)) {
+            debug(DBG_ERR, "verifyocspcert: no status found in OCSP response");
+            ret = 0;
+            goto done;
+        }
+
+        /* allow 60 seconds of skew, no max age. */
+        if (!OCSP_check_validity(this_update, next_update, 60, -1)) {
+            debug(DBG_ERR, "verifyocspcert: OCSP response is expired, or not yet valid");
+            ret = 0;
+            goto done;
+        }
+        switch (ocsp_status) {
+        case V_OCSP_CERTSTATUS_GOOD:
+            debug(DBG_DBG, "verifyocspcert: good OCSP status");
+            break;
+        case V_OCSP_CERTSTATUS_REVOKED: {
+            BIO *bmem = BIO_new(BIO_s_mem());
+            X509_NAME_print_ex(bmem, X509_get_subject_name(peer_cert), 0, XN_FLAG_RFC2253);
+            (void)BIO_flush(bmem);
+            BUF_MEM *bptr;
+            BIO_get_mem_ptr(bmem, &bptr);
+            debug(DBG_WARN, "verifyocspcert: certificate revoked: %.*s", bptr->length, bptr->data);
+            BIO_free(bmem);
+        }
+            ret = -1;
+            goto done;
+            break;
+        case V_OCSP_CERTSTATUS_UNKNOWN:
+        default:
+            debug(DBG_ERR, "verifyocspcert: OCSP status unknown");
+            ret = 0;
+            goto done;
+            break;
+        }
+
+        num--;
+        if (num <= 0) {
+            break;
+        }
+        peer_cert = issuer;
+        issuer = sk_X509_value(chain, num);
+        if (issuer == NULL) {
+            /* Error */
+            debug(DBG_ERR, "verifyocspcert: NULL in peer chain");
+            ret = 0;
+            goto done;
+        }
+        OCSP_REQUEST_free(req);
+        req = NULL;
+    }
+
+done:
+    if (aia != NULL)
+        X509_email_free(aia);
+    if (host != NULL)
+        OPENSSL_free(host);
+    if (path != NULL)
+        OPENSSL_free(path);
+    if (port != NULL)
+        OPENSSL_free(port);
+    if (req != NULL)
+        OCSP_REQUEST_free(req);
+    if (resp != NULL)
+        OCSP_RESPONSE_free(resp);
+    if (basic != NULL)
+        OCSP_BASICRESP_free(basic);
+    if (bio != NULL)
+        BIO_free_all(bio);
+    if (ctx != NULL)
+        SSL_CTX_free(ctx);
+    if (req_ctx != NULL)
+        OCSP_REQ_CTX_free(req_ctx);
+    return ret;
+}
+
 int verifyconfcert(X509 *cert, struct clsrvconf *conf, const char *connectname, const char *nairealm) {
     char *subject;
     int ok = 1;
@@ -1199,6 +1557,10 @@ int conftls_cb(struct gconffile **cf, void *arg, char *block, char *opt, char *v
                           "TlsVersion", CONF_STR, &tlsversion,
                           "DtlsVersion", CONF_STR, &dtlsversion,
                           "DhFile", CONF_STR, &dhfile,
+                          "OCSPCheck", CONF_BLN, &conf->ocspcheck,
+                          "ResponderURL", CONF_STR, &conf->responder_url,
+                          "OverrideAIA", CONF_BLN, &conf->override_aia,
+                          "AddNonce", CONF_BLN, &conf->add_nonce,
                           NULL)) {
         debug(DBG_ERR, "conftls_cb: configuration error in block %s", val);
         goto errexit;
@@ -1276,6 +1638,12 @@ int conftls_cb(struct gconffile **cf, void *arg, char *block, char *opt, char *v
 #endif
     }
 
+    if (conf->ocspcheck && conf->override_aia && conf->responder_url == NULL) {
+        /* OCSP checking is on, AIA override is on, but no URL was given. */
+        debug(DBG_ERR, "error in block %s, OverrideAIA requested without a ResponderURL", val);
+        goto errexit;
+    }
+
     conf->name = stringcopy(val, 0);
     if (!conf->name) {
         debug(DBG_ERR, "conftls_cb: malloc failed");
@@ -1311,6 +1679,7 @@ errexit:
 #else
     DH_free(conf->dhparam);
 #endif
+    free(conf->responder_url);
     free(conf);
     return 0;
 }

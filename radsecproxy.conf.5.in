@@ -1043,6 +1043,29 @@ for DTLS.
 DH parameter \fIfile\fR to use. See \fBopenssl-dhparam\fR(1)
 .br
 Note: starting with OpenSSL 3.0, use of custom DH parameters is discouraged.
+.RE
+
+.BR "OCSPCheck (" on | off )
+.RS
+Enable checking peer certificate against an OCSP server provided in the certificate's Authority Information Access extension, or configured with the ResponderURL command (default off).
+.RE
+
+.BR "ResponderURL " ocsp_url
+.RS
+Provide an alternate OCSP server to query if the peer certificate does not include
+an AIA extension, or if the extension does not include an OCSP server.  When used
+with OverrideAIA, this OCSP URL will be used instead of any included in the certificate.
+.RE
+
+.BR "OverrideAIA (" on | off )
+.RS
+When OverrideAIA is enabled, and ResponderURL is set, OCSP servers specified in a peer
+certificate will be ignored and the ResponderURL will be queried instead (default off).
+.RE
+
+.BR "AddNonce (" on | off )
+.RS
+Include a unique nonce in each OCSP request (default off).
 
 .SH "REWRITE BLOCK"
 .nf
