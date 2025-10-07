@@ -44,6 +44,10 @@ struct tls {
     SSL_CTX *dtlsctx;
     SSL *dtlssslprep;
     pthread_mutex_t lock;
+    uint8_t ocspcheck;
+    char *responder_url;
+    uint8_t override_aia;
+    uint8_t add_nonce;
 };
 
 #if defined(RADPROT_TLS) || defined(RADPROT_DTLS)
